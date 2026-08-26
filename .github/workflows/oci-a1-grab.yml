@@ -235,7 +235,14 @@ jobs:
             exit 1
           fi
 
-          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq 'length')
+          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq -r 'length' 2>/dev/null)
+
+          if ! [[ "$EXISTING_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Existing-instance count is not a valid integer: [$EXISTING_COUNT]"
+            echo "Parsed instance list:"
+            printf '%s\n' "$EXISTING_INSTANCES"
+            exit 1
+          fi
 
           if [ "$EXISTING_COUNT" -gt 0 ]; then
             echo "Found $EXISTING_COUNT non-terminated A1 instance(s)."
