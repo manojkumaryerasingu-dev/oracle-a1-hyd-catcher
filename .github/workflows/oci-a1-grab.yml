@@ -102,6 +102,7 @@ jobs:
           OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
         run: |
+  set +e
           set -u
 
           TARGET_SHAPE="VM.Standard.A1.Flex"
