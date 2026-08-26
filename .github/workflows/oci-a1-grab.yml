@@ -235,7 +235,17 @@ jobs:
             exit 1
           fi
 
-          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq 'length')
+          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq -r 'length' 2>/dev/null)
+
+          # jq should always return an integer here. Guard against an empty
+          # or malformed value so bash never emits "integer expression expected".
+          if ! [[ "$EXISTING_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Existing-instance count is not a valid integer: [$EXISTING_COUNT]"
+            echo "----- Parsed instance list -----"
+            printf '%s\n' "$EXISTING_INSTANCES"
+            echo "--------------------------------"
+            exit 1
+          fi
 
           if [ "$EXISTING_COUNT" -gt 0 ]; then
             echo "Found $EXISTING_COUNT non-terminated A1 instance(s)."
@@ -278,9 +288,9 @@ jobs:
           if [ "$CREATE_RC" -ne 0 ]; then
             echo "A1 launch failed (exit ${CREATE_RC})."
             echo "----- OCI stderr -----"
-            printf '%s\\n' "$CREATE_ERR"
+            printf '%s\n' "$CREATE_ERR"
             echo "----- OCI stdout -----"
-            printf '%s\\n' "$CREATE_RESULT"
+            printf '%s\n' "$CREATE_RESULT"
             echo "---------------------"
 
             if is_retryable_capacity_error "$CREATE_ERR"; then
@@ -294,7 +304,21 @@ jobs:
             exit 1
           fi
 
-          INSTANCE_ID=$(printf '%s\n' "$CREATE_RESULT" | jq -r '.data.id // empty')
+          CREATE_JSON_ERR_FILE=$(mktemp)
+          INSTANCE_ID=$(printf '%s\n' "$CREATE_RESULT" | jq -r '.data.id // empty' 2>"$CREATE_JSON_ERR_FILE")
+          CREATE_JSON_RC=$?
+          CREATE_JSON_ERR=$(cat "$CREATE_JSON_ERR_FILE")
+          rm -f "$CREATE_JSON_ERR_FILE"
+
+          if [ "$CREATE_JSON_RC" -ne 0 ]; then
+            echo "ERROR: OCI launch succeeded but stdout was not valid JSON."
+            echo "----- jq stderr -----"
+            printf '%s\n' "$CREATE_JSON_ERR"
+            echo "----- OCI stdout -----"
+            printf '%s\n' "$CREATE_RESULT"
+            echo "---------------------"
+            exit 1
+          fi
 
           if [ -z "$INSTANCE_ID" ]; then
             echo "ERROR: OCI launch returned success but no instance OCID was found."
