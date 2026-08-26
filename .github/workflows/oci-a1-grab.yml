@@ -175,6 +175,13 @@ jobs:
 
           echo "=== Checking for an existing non-terminated A1 ==="
 
+          echo "=== DEBUG: RAW OCI INSTANCE LIST ==="
+          oci --no-retry compute instance list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --all \
+            --output json 2>&1 || true
+          echo "=== END DEBUG ==="
+
           LIST_RESULT=$(oci --no-retry compute instance list \
             --compartment-id "$OCI_COMPARTMENT_ID" \
             --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
