@@ -235,17 +235,7 @@ jobs:
             exit 1
           fi
 
-          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq -r 'length' 2>/dev/null)
-
-          # jq should always return an integer here. Guard against an empty
-          # or malformed value so bash never emits "integer expression expected".
-          if ! [[ "$EXISTING_COUNT" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: Existing-instance count is not a valid integer: [$EXISTING_COUNT]"
-            echo "----- Parsed instance list -----"
-            printf '%s\n' "$EXISTING_INSTANCES"
-            echo "--------------------------------"
-            exit 1
-          fi
+          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq 'length')
 
           if [ "$EXISTING_COUNT" -gt 0 ]; then
             echo "Found $EXISTING_COUNT non-terminated A1 instance(s)."
@@ -305,20 +295,19 @@ jobs:
           fi
 
           CREATE_JSON_ERR_FILE=$(mktemp)
-          INSTANCE_ID=$(printf '%s\n' "$CREATE_RESULT" | jq -r '.data.id // empty' 2>"$CREATE_JSON_ERR_FILE")
+          CREATE_JSON_TYPE=$(printf '%s\n' "$CREATE_RESULT" | jq -r 'type' 2>"$CREATE_JSON_ERR_FILE")
           CREATE_JSON_RC=$?
           CREATE_JSON_ERR=$(cat "$CREATE_JSON_ERR_FILE")
           rm -f "$CREATE_JSON_ERR_FILE"
 
-          if [ "$CREATE_JSON_RC" -ne 0 ]; then
-            echo "ERROR: OCI launch succeeded but stdout was not valid JSON."
-            echo "----- jq stderr -----"
+          if [ "$CREATE_JSON_RC" -ne 0 ] || [ "$CREATE_JSON_TYPE" != "object" ]; then
+            echo "ERROR: OCI launch returned success, but the response was not valid JSON."
             printf '%s\n' "$CREATE_JSON_ERR"
-            echo "----- OCI stdout -----"
-            printf '%s\n' "$CREATE_RESULT"
-            echo "---------------------"
+            print_oci_error "$CREATE_RESULT"
             exit 1
           fi
+
+          INSTANCE_ID=$(printf '%s\n' "$CREATE_RESULT" | jq -r '.data.id // empty')
 
           if [ -z "$INSTANCE_ID" ]; then
             echo "ERROR: OCI launch returned success but no instance OCID was found."
@@ -355,6 +344,19 @@ jobs:
           rm -f "$VERIFY_ERR_FILE"
 
           if [ "$VERIFY_RC" -eq 0 ]; then
+              VERIFY_JSON_ERR_FILE=$(mktemp)
+              VERIFY_JSON_TYPE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r 'type' 2>"$VERIFY_JSON_ERR_FILE")
+              VERIFY_JSON_RC=$?
+              VERIFY_JSON_ERR=$(cat "$VERIFY_JSON_ERR_FILE")
+              rm -f "$VERIFY_JSON_ERR_FILE"
+
+              if [ "$VERIFY_JSON_RC" -ne 0 ] || [ "$VERIFY_JSON_TYPE" != "object" ]; then
+                echo "Verification $i/20: OCI returned an invalid JSON response."
+                printf '%s\n' "$VERIFY_JSON_ERR"
+                sleep 15
+                continue
+              fi
+
               ACTUAL_STATE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."lifecycle-state" // "UNKNOWN"')
               ACTUAL_SHAPE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data.shape // "UNKNOWN"')
               ACTUAL_OCPUS=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."shape-config".ocpus // 0')
