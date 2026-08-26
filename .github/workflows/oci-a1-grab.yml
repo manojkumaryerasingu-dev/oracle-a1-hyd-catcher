@@ -1,0 +1,333 @@
+name: OCI A1 Instance Auto Grab
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: oci-a1-grab
+  cancel-in-progress: false
+
+jobs:
+  grab-a1-instance:
+    runs-on: ubuntu-latest
+
+    env:
+      OCI_CLI_VENV: ${{ github.workspace }}/.cache/oci-cli-venv
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ap-hyderabad-1
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache OCI CLI environment
+        id: oci-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OCI_CLI_VENV }}
+          key: oci-cli-venv-${{ runner.os }}-${{ runner.arch }}-py3.11-v1
+
+      - name: Cache pip packages
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-oci-cli-${{ runner.os }}-${{ runner.arch }}-py3.11-v1
+
+      - name: Install OCI CLI
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv --copies "$OCI_CLI_VENV"
+          "$OCI_CLI_VENV/bin/pip" install --upgrade pip oci-cli
+
+      - name: Verify tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$OCI_CLI_VENV/bin" >> "$GITHUB_PATH"
+          command -v jq
+          "$OCI_CLI_VENV/bin/oci" --version
+
+      - name: Configure OCI CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            OCI_CLI_USER
+            OCI_CLI_TENANCY
+            OCI_CLI_FINGERPRINT
+            OCI_CLI_KEY_CONTENT
+          )
+
+          for var in "${required_vars[@]}"; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: GitHub secret $var is missing or empty."
+              exit 1
+            fi
+          done
+
+          mkdir -p "$HOME/.oci"
+
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" | tr -d '\r' > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=${HOME}/.oci/oci_api_key.pem
+          EOF
+          chmod 600 "$HOME/.oci/config"
+
+          echo "OCI CLI configuration written for region ${OCI_CLI_REGION}."
+
+      - name: Catch A1 capacity
+        shell: bash
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          set -u
+
+          TARGET_SHAPE="VM.Standard.A1.Flex"
+          TARGET_OCPUS=2
+          TARGET_MEMORY=8
+
+          echo "=== OCI A1 capacity catcher ==="
+          echo "Region: ${OCI_CLI_REGION}"
+          echo "Availability Domain: ${OCI_AVAILABILITY_DOMAIN}"
+          echo "Target: ${TARGET_SHAPE} / ${TARGET_OCPUS} OCPU / ${TARGET_MEMORY} GB"
+
+          # Do not silently treat missing infrastructure secrets as a capacity miss.
+          required_vars=(
+            OCI_COMPARTMENT_ID
+            OCI_SUBNET_ID
+            OCI_AVAILABILITY_DOMAIN
+            OCI_IMAGE_ID
+            OCI_SSH_PUBLIC_KEY
+          )
+
+          for var in "${required_vars[@]}"; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: GitHub secret $var is missing or empty."
+              exit 1
+            fi
+          done
+
+          # The SSH key is passed through OCI CLI's supported file option,
+          # avoiding JSON quoting problems.
+          SSH_KEY_FILE="$RUNNER_TEMP/oci-authorized_keys"
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" | tr -d '\r' > "$SSH_KEY_FILE"
+          chmod 600 "$SSH_KEY_FILE"
+
+          # OCI CLI has its own retry mechanism. Disable it here so one
+          # scheduled GitHub run makes one OCI launch attempt. Temporary
+          # capacity/throttling errors are retried by the next scheduled run.
+          is_retryable_capacity_error() {
+            local text="$1"
+
+            if printf '%s\n' "$text" | grep -Eiq \
+              'Out of host capacity|Out of capacity for shape|TooManyRequests|Too Many Requests|User[- ]rate limit|HTTP[[:space:]]*429'; then
+              return 0
+            fi
+
+            # InternalError is retryable only when the response also
+            # contains an explicit capacity-related message.
+            if printf '%s\n' "$text" | grep -Eiq 'InternalError' &&
+               printf '%s\n' "$text" | grep -Eiq 'capacity|no host capacity'; then
+              return 0
+            fi
+
+            return 1
+          }
+
+          print_oci_error() {
+            local text="$1"
+            echo "----- OCI response -----"
+            printf '%s\n' "$text"
+            echo "------------------------"
+          }
+
+          # ------------------------------------------------------------
+          # 1. Existing-instance guard.
+          #
+          # Search the configured compartment + AD for the target shape.
+          # Every lifecycle state except TERMINATED blocks a new launch.
+          # This includes PROVISIONING, STARTING, RUNNING, STOPPING,
+          # STOPPED and TERMINATING.
+          # ------------------------------------------------------------
+
+          echo "=== Checking for an existing non-terminated A1 ==="
+
+          LIST_RESULT=$(oci --no-retry compute instance list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+            --all \
+            --output json 2>&1)
+
+          LIST_RC=$?
+
+          if [ "$LIST_RC" -ne 0 ]; then
+            echo "ERROR: OCI instance-list failed."
+            echo "This is not treated as a capacity retry."
+            print_oci_error "$LIST_RESULT"
+            exit 1
+          fi
+
+          EXISTING_INSTANCES=$(printf '%s\n' "$LIST_RESULT" | jq -c \
+            --arg shape "$TARGET_SHAPE" '
+              [
+                .data[]
+                | select(.shape == $shape)
+                | select((."lifecycle-state" // "") != "TERMINATED")
+                | {
+                    id: .id,
+                    state: (."lifecycle-state" // "UNKNOWN"),
+                    shape: (.shape // "UNKNOWN"),
+                    ocpus: (."shape-config".ocpus // 0),
+                    memory: (."shape-config"."memory-in-gbs" // 0),
+                    ad: (."availability-domain" // "UNKNOWN")
+                  }
+              ]
+            ' 2>&1)
+
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Could not parse OCI instance-list response."
+            print_oci_error "$EXISTING_INSTANCES"
+            exit 1
+          fi
+
+          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq 'length')
+
+          if [ "$EXISTING_COUNT" -gt 0 ]; then
+            echo "Found $EXISTING_COUNT non-terminated A1 instance(s)."
+            printf '%s\n' "$EXISTING_INSTANCES" | jq -r '
+              .[] |
+              "ID: \(.id)\nState: \(.state)\nShape: \(.shape)\nOCPU: \(.ocpus)\nMemory: \(.memory) GB\nAD: \(.ad)\n---"
+            '
+
+            echo "SAFE STOP: an A1 already exists."
+            echo "No resize and no second launch will be attempted."
+            exit 0
+          fi
+
+          echo "No non-terminated A1 exists. Attempting direct 2 OCPU / 8 GB launch."
+
+          # ------------------------------------------------------------
+          # 2. Direct launch.
+          # ------------------------------------------------------------
+
+          CREATE_RESULT=$(oci --no-retry compute instance launch \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+            --shape "$TARGET_SHAPE" \
+            --shape-config "{\"ocpus\": ${TARGET_OCPUS}, \"memoryInGBs\": ${TARGET_MEMORY}}" \
+            --image-id "$OCI_IMAGE_ID" \
+            --subnet-id "$OCI_SUBNET_ID" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file "$SSH_KEY_FILE" \
+            --display-name "A1-Auto-Grabbed" \
+            --output json 2>&1)
+
+          CREATE_RC=$?
+
+          if [ "$CREATE_RC" -ne 0 ]; then
+            echo "A1 launch failed."
+            print_oci_error "$CREATE_RESULT"
+
+            if is_retryable_capacity_error "$CREATE_RESULT"; then
+              echo "TEMPORARY CAPACITY/THROTTLING ERROR."
+              echo "This run will stop here; the next scheduled run will retry."
+              exit 0
+            fi
+
+            echo "NON-RETRYABLE OCI ERROR."
+            echo "Credentials, AD, subnet, image, permissions, quota, or another configuration issue must be fixed."
+            exit 1
+          fi
+
+          INSTANCE_ID=$(printf '%s\n' "$CREATE_RESULT" | jq -r '.data.id // empty')
+
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "ERROR: OCI launch returned success but no instance OCID was found."
+            print_oci_error "$CREATE_RESULT"
+            exit 1
+          fi
+
+          echo "Launch accepted."
+          echo "Instance OCID: $INSTANCE_ID"
+          echo "The instance now blocks future launches even while it is provisioning."
+
+          # ------------------------------------------------------------
+          # 3. Verify the actual launched configuration.
+          #
+          # Do not create another instance if verification is slow.
+          # The instance already exists and the next scheduled run will
+          # see it through the non-TERMINATED guard.
+          # ------------------------------------------------------------
+
+          VERIFIED=false
+
+          for i in $(seq 1 20); do
+            VERIFY_RESULT=$(oci --no-retry compute instance get \
+              --instance-id "$INSTANCE_ID" \
+              --output json 2>&1)
+
+            VERIFY_RC=$?
+
+            if [ "$VERIFY_RC" -eq 0 ]; then
+              ACTUAL_STATE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."lifecycle-state" // "UNKNOWN"')
+              ACTUAL_SHAPE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data.shape // "UNKNOWN"')
+              ACTUAL_OCPUS=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."shape-config".ocpus // 0')
+              ACTUAL_MEMORY=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."shape-config"."memory-in-gbs" // 0')
+              ACTUAL_AD=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."availability-domain" // "UNKNOWN"')
+
+              echo "Verification $i/20:"
+              echo "  State: $ACTUAL_STATE"
+              echo "  Shape: $ACTUAL_SHAPE"
+              echo "  OCPU: $ACTUAL_OCPUS"
+              echo "  Memory: ${ACTUAL_MEMORY} GB"
+              echo "  AD: $ACTUAL_AD"
+
+              if [ "$ACTUAL_SHAPE" = "$TARGET_SHAPE" ] && \
+                 awk "BEGIN { exit !($ACTUAL_OCPUS >= $TARGET_OCPUS && $ACTUAL_MEMORY >= $TARGET_MEMORY) }"; then
+                VERIFIED=true
+                break
+              fi
+
+              if [ "$ACTUAL_STATE" = "TERMINATING" ] || [ "$ACTUAL_STATE" = "TERMINATED" ]; then
+                echo "ERROR: Newly created A1 entered a terminal state."
+                exit 1
+              fi
+            else
+              echo "Verification $i/20: OCI get did not succeed yet."
+            fi
+
+            sleep 15
+          done
+
+          if [ "$VERIFIED" = true ]; then
+            echo "SUCCESS: A1 verified at or above 2 OCPU / 8 GB."
+            echo "Disable this scheduled workflow after confirming the instance in OCI Console."
+            exit 0
+          fi
+
+          echo "ERROR: Launch was accepted, but final configuration was not verified within the verification window."
+          echo "IMPORTANT: Instance $INSTANCE_ID already exists. Do not manually launch another A1."
+          echo "Inspect the instance; the next scheduled run will also see the non-TERMINATED instance and will not duplicate it."
+          exit 1
