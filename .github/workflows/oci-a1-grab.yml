@@ -156,9 +156,6 @@ jobs:
             echo "------------------------"
           }
 
-          # ----------------------------------------------------------
-          # 1. Existing A1 guard
-          # ----------------------------------------------------------
           echo "=== Checking for an existing non-terminated A1 ==="
 
           LIST_ERR_FILE=$(mktemp)
@@ -213,9 +210,6 @@ jobs:
 
           echo "No non-terminated A1 exists. Attempting direct 2 OCPU / 8 GB launch."
 
-          # ----------------------------------------------------------
-          # 2. Direct launch
-          # ----------------------------------------------------------
           CREATE_ERR_FILE=$(mktemp)
           CREATE_RESULT=$(oci --no-retry compute instance launch \
             --compartment-id "$OCI_COMPARTMENT_ID" \
@@ -258,9 +252,6 @@ ${CREATE_RESULT}"
 
           echo "Launch accepted. Instance OCID: ${INSTANCE_ID}"
 
-          # ----------------------------------------------------------
-          # 3. Verify configuration
-          # ----------------------------------------------------------
           VERIFIED=false
 
           for i in $(seq 1 20); do
