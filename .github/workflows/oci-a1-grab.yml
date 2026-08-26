@@ -81,7 +81,6 @@ jobs:
           printf '%s\n' "$OCI_CLI_KEY_CONTENT" | tr -d '\r' > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
 
-          # No leading spaces (heredoc indent breaks OCI config)
           {
             echo "[DEFAULT]"
             echo "user=${OCI_CLI_USER}"
@@ -93,8 +92,6 @@ jobs:
           chmod 600 "$HOME/.oci/config"
 
           echo "OCI CLI configuration written for region ${OCI_CLI_REGION}."
-          oci --no-retry iam region list --output table >/dev/null
-          echo "OCI auth smoke test OK."
 
       - name: Catch A1 capacity
         shell: bash
@@ -160,9 +157,8 @@ jobs:
           }
 
           # ----------------------------------------------------------
-          # 1. Existing A1 guard (compartment-wide, no AD filter)
+          # 1. Existing A1 guard
           # ----------------------------------------------------------
-
           echo "=== Checking for an existing non-terminated A1 ==="
 
           LIST_ERR_FILE=$(mktemp)
@@ -176,7 +172,6 @@ jobs:
 
           if [ "$LIST_RC" -ne 0 ]; then
             echo "ERROR: OCI instance-list failed (exit ${LIST_RC})."
-            echo "This is not treated as a capacity retry."
             echo "----- stderr -----"
             printf '%s\n' "$LIST_ERR"
             echo "----- stdout -----"
@@ -200,18 +195,11 @@ jobs:
                     ad: (."availability-domain" // "UNKNOWN")
                   }
               ]
-            ' 2>&1)
+            ' 2>/dev/null)
           JQ_RC=$?
 
           if [ "$JQ_RC" -ne 0 ]; then
             echo "ERROR: Could not parse OCI instance-list JSON."
-            echo "----- jq error -----"
-            printf '%s\n' "$EXISTING_INSTANCES"
-            echo "----- raw stdout -----"
-            printf '%s\n' "$LIST_RESULT"
-            echo "----- stderr -----"
-            printf '%s\n' "$LIST_ERR"
-            echo "------------------------"
             exit 1
           fi
 
@@ -219,10 +207,6 @@ jobs:
 
           if [ "$EXISTING_COUNT" -gt 0 ]; then
             echo "Found ${EXISTING_COUNT} non-terminated A1 instance(s)."
-            printf '%s\n' "$EXISTING_INSTANCES" | jq -r '
-              .[] |
-              "ID: \(.id)\nState: \(.state)\nShape: \(.shape)\nOCPU: \(.ocpus)\nMemory: \(.memory) GB\nAD: \(.ad)\n---"
-            '
             echo "SAFE STOP: an A1 already exists. No second launch."
             exit 0
           fi
@@ -230,9 +214,8 @@ jobs:
           echo "No non-terminated A1 exists. Attempting direct 2 OCPU / 8 GB launch."
 
           # ----------------------------------------------------------
-          # 2. Direct launch (AD required here)
+          # 2. Direct launch
           # ----------------------------------------------------------
-
           CREATE_ERR_FILE=$(mktemp)
           CREATE_RESULT=$(oci --no-retry compute instance launch \
             --compartment-id "$OCI_COMPARTMENT_ID" \
@@ -262,11 +245,10 @@ ${CREATE_RESULT}"
             fi
 
             echo "NON-RETRYABLE OCI ERROR."
-            echo "Fix credentials, AD, subnet, image, permissions, or quota."
             exit 1
           fi
 
-          INSTANCE_ID=$(printf '%s\n' "$CREATE_RESULT" | jq -r '.data.id // empty')
+          INSTANCE_ID=$(printf '%s\n' "$CREATE_RESULT" | jq -r '.data.id // empty' 2>/dev/null)
 
           if [ -z "$INSTANCE_ID" ]; then
             echo "ERROR: Launch returned success but no instance OCID."
@@ -274,14 +256,11 @@ ${CREATE_RESULT}"
             exit 1
           fi
 
-          echo "Launch accepted."
-          echo "Instance OCID: ${INSTANCE_ID}"
-          echo "Future runs will see this non-terminated instance and will not duplicate."
+          echo "Launch accepted. Instance OCID: ${INSTANCE_ID}"
 
           # ----------------------------------------------------------
-          # 3. Verify configuration (best-effort)
+          # 3. Verify configuration
           # ----------------------------------------------------------
-
           VERIFIED=false
 
           for i in $(seq 1 20); do
@@ -291,18 +270,12 @@ ${CREATE_RESULT}"
             VERIFY_RC=$?
 
             if [ "$VERIFY_RC" -eq 0 ]; then
-              ACTUAL_STATE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."lifecycle-state" // "UNKNOWN"')
-              ACTUAL_SHAPE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data.shape // "UNKNOWN"')
-              ACTUAL_OCPUS=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."shape-config".ocpus // 0')
-              ACTUAL_MEMORY=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."shape-config"."memory-in-gbs" // 0')
-              ACTUAL_AD=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."availability-domain" // "UNKNOWN"')
+              ACTUAL_STATE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."lifecycle-state" // "UNKNOWN"' 2>/dev/null)
+              ACTUAL_SHAPE=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data.shape // "UNKNOWN"' 2>/dev/null)
+              ACTUAL_OCPUS=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."shape-config".ocpus // 0' 2>/dev/null)
+              ACTUAL_MEMORY=$(printf '%s\n' "$VERIFY_RESULT" | jq -r '.data."shape-config"."memory-in-gbs" // 0' 2>/dev/null)
 
-              echo "Verification ${i}/20:"
-              echo "  State: ${ACTUAL_STATE}"
-              echo "  Shape: ${ACTUAL_SHAPE}"
-              echo "  OCPU: ${ACTUAL_OCPUS}"
-              echo "  Memory: ${ACTUAL_MEMORY} GB"
-              echo "  AD: ${ACTUAL_AD}"
+              echo "Verification ${i}/20: State: ${ACTUAL_STATE}, Shape: ${ACTUAL_SHAPE}, OCPU: ${ACTUAL_OCPUS}, Memory: ${ACTUAL_MEMORY} GB"
 
               if [ "$ACTUAL_SHAPE" = "$TARGET_SHAPE" ] && \
                  awk "BEGIN { exit !($ACTUAL_OCPUS >= $TARGET_OCPUS && $ACTUAL_MEMORY >= $TARGET_MEMORY) }"; then
@@ -314,8 +287,6 @@ ${CREATE_RESULT}"
                 echo "ERROR: Newly created A1 entered a terminal state."
                 exit 1
               fi
-            else
-              echo "Verification ${i}/20: get not ready yet."
             fi
 
             sleep 15
@@ -323,11 +294,8 @@ ${CREATE_RESULT}"
 
           if [ "$VERIFIED" = true ]; then
             echo "SUCCESS: A1 verified at or above 2 OCPU / 8 GB."
-            echo "Disable this workflow after confirming the instance in OCI Console."
             exit 0
           fi
 
-          echo "Launch accepted but verify window ended."
-          echo "IMPORTANT: Instance ${INSTANCE_ID} already exists — do not create another."
-          echo "Next scheduled run will detect it and stop."
+          echo "Launch accepted but verify window ended. Instance ${INSTANCE_ID} exists."
           exit 0
