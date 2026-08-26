@@ -235,12 +235,15 @@ jobs:
             exit 1
           fi
 
-          EXISTING_COUNT=$(printf '%s\n' "$EXISTING_INSTANCES" | jq -r 'length' 2>/dev/null)
+          # Count the filtered array safely.
+          # If OCI returns no matching A1 instances, EXISTING_INSTANCES is [].
+          # jq must therefore return 0, never [] or an empty string.
+          EXISTING_COUNT=$(jq -r 'if type == "array" then length else 0 end' <<< "${EXISTING_INSTANCES:-[]}")
 
           if ! [[ "$EXISTING_COUNT" =~ ^[0-9]+$ ]]; then
             echo "ERROR: Existing-instance count is not a valid integer: [$EXISTING_COUNT]"
             echo "Parsed instance list:"
-            printf '%s\n' "$EXISTING_INSTANCES"
+            printf '%s\n' "${EXISTING_INSTANCES:-[]}"
             exit 1
           fi
 
